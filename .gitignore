@@ -5,8 +5,10 @@ test/
 wandb/
 output/
 uploads/
+videos/
+models/
 .env
-__pycache__/
+**/__pycache__/
 runs/
 weights/
 .DS_Store
