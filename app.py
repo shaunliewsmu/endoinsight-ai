@@ -8,12 +8,32 @@ from pathlib import Path
 import os
 import json
 from datetime import datetime
+from pymongo import MongoClient
+from bson import ObjectId
 
 # Import the custom modules
 from src.config import WEIGHTS_PATH, DATA_PATH, DEVICE
 from src.yolo_detector import YOLODetector
 from src.resnet_classifier import ResNetClassifier
 from src.llm_analyzer import LLMAnalyzer
+
+def serialize_datetime(obj):
+    """Convert datetime objects to ISO format strings."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"Type {type(obj)} not serializable")
+
+def prepare_for_json(data):
+    """Prepare MongoDB document for JSON serialization."""
+    if isinstance(data, dict):
+        return {k: prepare_for_json(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [prepare_for_json(item) for item in data]
+    elif isinstance(data, datetime):
+        return data.isoformat()
+    elif isinstance(data, ObjectId):
+        return str(data)
+    return data
 
 app = FastAPI()
 
@@ -23,6 +43,11 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Mount the output directory to make images accessible via URL
 app.mount("/output", StaticFiles(directory="output"), name="output")
+
+# Initialize MongoDB client
+client = MongoClient('mongodb://localhost:27017/')
+db = client['hnc_detection']
+collection = db['video_analysis']
 
 # Initialize the YOLO detector
 detector = YOLODetector(
@@ -155,8 +180,16 @@ async def video_analyze(file: UploadFile = File(...)):
         # Combine results
         final_result = {
             **video_data,
-            "llm_analysis": llm_analysis.model_dump()
+            "llm_analysis": llm_analysis.model_dump(),
+            "created_at": datetime.now()
         }
+        
+        # Save to MongoDB
+        inserted_id = collection.insert_one(final_result).inserted_id
+        
+        # Prepare response by converting MongoDB document for JSON serialization
+        final_result = prepare_for_json(final_result)
+        final_result['_id'] = str(inserted_id)
         
         return JSONResponse(content=final_result)
         
@@ -340,24 +373,19 @@ async def process_video(file: UploadFile):
         
 @app.get("/detections")
 async def list_detections():
-    """List all detection files and folders in the output directory.
-
-    Returns:
-        dict: Contains:
-            - status: Success/error status
-            - detections: Grouped list of all detections (videos, images, frame folders)
-            - summary: Count summary of different types of detections
-
-    Raises:
-        HTTPException: If unable to access or read the output directory
-    """
+    """List all detection results from MongoDB and filesystem."""
     try:
-        all_items = []
+        # Get all documents from MongoDB
+        mongo_results = []
+        for doc in collection.find().sort("created_at", -1):
+            # Prepare document for JSON serialization
+            prepared_doc = prepare_for_json(doc)
+            mongo_results.append(prepared_doc)
         
-        # First, get all files and directories in the output folder
+        # Get filesystem items (for compatibility with existing files)
+        all_items = []
         for item in OUTPUT_DIR.iterdir():
             if item.is_file() and item.suffix in ['.jpg', '.mp4']:
-                # Handle regular image and video files
                 all_items.append({
                     "filename": item.name,
                     "type": "video" if item.suffix == '.mp4' else "image",
@@ -365,8 +393,7 @@ async def list_detections():
                     "timestamp": datetime.fromtimestamp(item.stat().st_mtime).isoformat()
                 })
             elif item.is_dir() and item.name.startswith('qualifying_frames_'):
-                # Handle qualifying frames folders
-                frames = list(item.glob('*.jpg'))  # Get all frames in the folder
+                frames = list(item.glob('*.jpg'))
                 frame_infos = [
                     {
                         "filename": frame.name,
@@ -376,7 +403,6 @@ async def list_detections():
                     for frame in sorted(frames)
                 ]
                 
-                # Add folder information
                 all_items.append({
                     "filename": item.name,
                     "type": "qualifying_frames_folder",
@@ -386,11 +412,12 @@ async def list_detections():
                     "frames": frame_infos
                 })
         
-        # Sort all items by timestamp
+        # Sort filesystem items by timestamp
         sorted_items = sorted(all_items, key=lambda x: x["timestamp"], reverse=True)
         
-        # Group items by type for better organization
+        # Group items
         grouped_detections = {
+            "analysis_results": mongo_results,  # Add MongoDB results
             "videos": [item for item in sorted_items if item["type"] == "video"],
             "images": [item for item in sorted_items if item["type"] == "image"],
             "qualifying_frames_folders": [item for item in sorted_items if item["type"] == "qualifying_frames_folder"]
@@ -400,6 +427,7 @@ async def list_detections():
             "status": "success",
             "detections": grouped_detections,
             "summary": {
+                "total_analyses": len(mongo_results),
                 "total_videos": len(grouped_detections["videos"]),
                 "total_images": len(grouped_detections["images"]),
                 "total_folders": len(grouped_detections["qualifying_frames_folders"])
@@ -418,5 +446,5 @@ async def list_detections():
 if __name__ == "__main__":
     """Main entry point for running the FastAPI application."""
     import uvicorn
-    print("Starting server with LLM analysis capabilities...")
+    print("Starting server with Ollama and MongoDB integration...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
