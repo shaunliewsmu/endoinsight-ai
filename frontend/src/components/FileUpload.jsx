@@ -88,7 +88,7 @@ function FileUpload() {
       <div className="card bg-base-100 border shadow-xl">
         <div className="card-body">
           <h2 className="card-title text-2xl mb-4 justify-center underline">Try it out now</h2>
-          <p className="">Experience the power of EndoInsight AI firsthand. Upload your cholecystectomy video for instant analysis.</p>
+          <p className="">Experience the power of AI H&N Cancer Screening firsthand. Upload your endoscopic video for instant analysis.</p>
           <div className="flex justify-center justify-items-center mb-4 w-128 h-64">
             <img src={medicalSvg} alt="Upload video" className="justify-center" />
           </div>

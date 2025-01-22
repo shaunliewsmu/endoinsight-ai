@@ -22,11 +22,11 @@ const TimelineItem = ({ step, event }) => (
   
   const Timeline = () => {
         const timelineData = [
-        { step: "Step 1", event: "Upload endoscopic surgery video for frame extraction using OpenCV" },
-        { step: "Step 2", event: "Perform YOLOv8 object segmentation on extracted frames" },
-        { step: "Step 3", event: "Extract visual features from YOLOv8 segmentation results" },
-        { step: "Step 4", event: "Generate textual explanations using Claude 3 Haiku via Amazon Bedrock" },
-        { step: "Step 5", event: "Integrate visual and textual data for comprehensive analysis output" }
+        { step: "Step 1", event: "Upload endoscopic video for analysis" },
+        { step: "Step 2", event: "rocess video using YOLOv5 detector for glottis detection and frame qualification" },
+        { step: "Step 3", event: "Apply ResNet50 classification on qualifying frames" },
+        { step: "Step 4", event: "Generate comprehensive analysis output using LLM Analyzer on selected frames and results" },
+        { step: "Step 5", event: "Display the analysis result and processed video and frames" }
       ];
   
     return (
