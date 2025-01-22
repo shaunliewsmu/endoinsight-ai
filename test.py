@@ -1,191 +1,341 @@
-from ultralytics import YOLO
-import cv2
-import numpy as np
-import torch
-from typing import Dict, Tuple, NamedTuple
+from pydantic import BaseModel, Field
+from pydantic_ai import Agent
+from pydantic_ai.models.ollama import OllamaModel 
+from pathlib import Path
+import base64
+import json
+from typing import List, Dict
+from datetime import datetime
+import asyncio
+import re
 
-class ColorClass(NamedTuple):
-    color: Tuple[int, int, int]
-    name: str
+class BoundingBox(BaseModel):
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    width: int
+    height: int
+    aspect_ratio: float
 
-class SegmentationClasses:
-    def __init__(self):
-        # the colour scheme is given based on the documentation
-        self.class_info: Dict[int, ColorClass] = {
-            0: ColorClass((127, 127, 127), 'Black Background'),
-            1: ColorClass((210, 140, 140), 'Abdominal Wall'),
-            2: ColorClass((255, 114, 114), 'Liver'),
-            3: ColorClass((231, 70, 156), 'Gastrointestinal Tract'),
-            4: ColorClass((186, 183, 75), 'Fat'),
-            5: ColorClass((170, 255, 0), 'Grasper'),
-            6: ColorClass((255, 85, 0), 'Connective Tissue'),
-            7: ColorClass((255, 0, 0), 'Blood'),
-            8: ColorClass((255, 255, 0), 'Cystic Duct'),
-            9: ColorClass((169, 255, 184), 'L-hook Electrocautery'),
-            10: ColorClass((255, 160, 165), 'Gallbladder'),
-            11: ColorClass((0, 50, 128), 'Hepatic Vein'),
-            12: ColorClass((111, 74, 0), 'Liver Ligament')
-        }
-        
-        self.color_to_class: Dict[Tuple[int, int, int], int] = {
-            info.color: class_index for class_index, info in self.class_info.items()
-        }
-        
-        self.name_to_class: Dict[str, int] = {
-            info.name: class_index for class_index, info in self.class_info.items()
-        }
-    
-    def get_class_from_color(self, color: Tuple[int, int, int]) -> int:
-        return self.color_to_class.get(color, -1)  # Returns -1 if color not found
-    
-    def get_color_from_class(self, class_index: int) -> Tuple[int, int, int]:
-        return self.class_info[class_index].color if class_index in self.class_info else (0, 0, 0)
-    
-    def get_name_from_class(self, class_index: int) -> str:
-        return self.class_info[class_index].name if class_index in self.class_info else "Unknown"
-    
-    def get_class_from_name(self, name: str) -> int:
-        return self.name_to_class.get(name, -1)  # Returns -1 if name not found
-    
-    def get_color_name(self, class_index: int) -> str:
-        if class_index in self.class_info:
-            color = self.class_info[class_index].color
-            return f"RGB{color}"
-        return "Unknown"
+class YOLODetection(BaseModel):
+    confidence: float
+    bbox: BoundingBox
 
-def process_video_with_yolo(video_path, yolo_model_path, output_path, conf_threshold=0.8):
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    model = YOLO(yolo_model_path)
-    model.to(device)
-    
-    cap = cv2.VideoCapture(video_path)
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
-    
-    segmentation_results = {}
-    frame_count = 0
+class ResNetClassification(BaseModel):
+    predicted_label: str
+    confidence: float
+    class_probabilities: Dict[str, float]
 
-    seg_classes = SegmentationClasses()
+class Frame(BaseModel):
+    frame_number: int
+    url: str
+    yolo_detection: YOLODetection
+    resnet_classification: ResNetClassification
 
-    def adjust_label_position(frame, label, top, left, font, font_scale, font_thickness):
-        (label_width, label_height), baseline = cv2.getTextSize(label, font, font_scale, font_thickness)
-        
-        if left + label_width > frame_width:
-            left = frame_width - label_width
-        
-        if top - label_height - baseline < 0:
-            top = label_height + baseline
-        
-        return top, left, font_scale
+class QualifyingFrames(BaseModel):
+    folder_url: str
+    count: int
+    frames: List[Frame]
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+class VideoProcessingResult(BaseModel):
+    status: str
+    qualifying_frames: QualifyingFrames
 
-        results = model(frame, conf=conf_threshold, device=device)[0]
-        frame_results = []
+class ConsolidatedAnalysis(BaseModel):
+    """Consolidated analysis output for all qualifying frames"""
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+    glottis_assessment: dict = Field(description="Overall glottis assessment")
+    suggested_actions: List[str] = Field(description="Clinical recommendations")
+    ai_performance: dict = Field(description="AI model performance metrics")
 
-        if results.masks is not None:
-            full_mask = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+class ImageAnalyzer:
+    def __init__(self, base_path: str = "/home/shaunliew/endoinsight-ai"):
+        self.base_path = base_path
+        self.vision_model = OllamaModel(model_name='llama3.2-vision')
+        self.agent = Agent(
+            model=self.vision_model,
+            result_retries=3,
+            system_prompt="""You are an expert head and neck cancer specialist analyzing laryngeal endoscopy images and AI detection/classification results.
 
-            for seg, box, cls in zip(results.masks.data, results.boxes.data, results.boxes.cls):
-                class_index = int(cls)
-                class_name = seg_classes.get_name_from_class(class_index)
-                # Skip the "Black Background" class
-                if class_name == "Black Background":
-                    continue
-                confidence = float(box[4])
+CRITICAL FORMAT RULES - READ CAREFULLY:
+1. Output EXACTLY ONE JSON object
+2. All values MUST be simple strings or arrays of strings
+3. NO nested objects or complex structures
+4. NO additional text before or after JSON
+5. Use ONLY the exact structure shown below
+
+ANALYSIS CONTEXT:
+1. Detection Metrics (YOLO):
+   - Confidence >0.8: Reliable glottis detection
+   - Aspect ratio >1.5: Proper anatomical view
+   - Bounding box size: Indicates structure visibility
+
+2. Classification Results (ResNet):
+   - "referral" label: Indicates need for specialist review
+   - High confidence: Suggests reliable assessment
+   - Multiple referral frames: Increases urgency
+
+REQUIRED OUTPUT FORMAT:
+{
+    "glottis_assessment": {
+        "overall_condition": "single string describing condition and detection reliability",
+        "symmetry": "single string analyzing structural symmetry with confidence context",
+        "tissue_state": "single string describing tissue characteristics and classification",
+        "abnormalities": [
+            "string describing specific finding 1",
+            "string describing specific finding 2"
+        ]
+    },
+    "suggested_actions": [
+        "string with clear referral recommendation",
+        "string with specific follow-up instructions"
+    ]
+}
+
+RESPONSE RULES:
+1. overall_condition:
+   - Include detection confidence
+   - Mention structure visibility
+   - Reference classification results
+
+2. symmetry:
+   - Describe structural balance
+   - Reference detection metrics
+   - Note any asymmetries
+
+3. tissue_state:
+   - Describe visible characteristics
+   - Note any abnormal features
+   - Reference classification confidence
+
+4. abnormalities:
+   - List specific findings as simple strings
+   - Include detection/classification context
+   - Maximum 3-4 findings
+
+5. suggested_actions:
+   - First action: Clear referral decision
+   - Second action: Specific follow-up plan
+   - Keep as simple strings
+
+CRITICAL: NO NESTED OBJECTS OR COMPLEX STRUCTURES ALLOWED
+
+Error Response Format:
+{
+    "glottis_assessment": {
+        "overall_condition": "Analysis error - insufficient quality for assessment",
+        "symmetry": "Unable to assess glottic symmetry",
+        "tissue_state": "Unable to assess tissue characteristics",
+        "abnormalities": ["Image quality prevents reliable assessment"]
+    },
+    "suggested_actions": ["Repeat imaging with improved quality"]
+}"""
+        )
+
+    def encode_image(self, image_path: str) -> str:
+        """Encode image to base64."""
+        with open(image_path, "rb") as img_file:
+            return base64.b64encode(img_file.read()).decode('utf-8')
+
+    def validate_json_structure(self, data: dict) -> bool:
+        """Validate that the JSON response has the correct structure."""
+        try:
+            # Check for required top-level keys
+            required_keys = {"glottis_assessment", "suggested_actions"}
+            if not all(key in data for key in required_keys):
+                return False
+            
+            # Check glottis_assessment structure
+            assessment = data["glottis_assessment"]
+            required_assessment_keys = {
+                "overall_condition", "symmetry", "tissue_state", "abnormalities"
+            }
+            if not all(key in assessment for key in required_assessment_keys):
+                return False
+            
+            # Validate types
+            if not isinstance(assessment["abnormalities"], list):
+                return False
+            if not isinstance(data["suggested_actions"], list):
+                return False
+            
+            # Validate string fields
+            string_fields = [
+                assessment["overall_condition"],
+                assessment["symmetry"],
+                assessment["tissue_state"]
+            ]
+            if not all(isinstance(field, str) for field in string_fields):
+                return False
                 
-                mask = (seg.cpu().numpy() > 0.5).astype(np.uint8)
-                mask = cv2.resize(mask, (frame_width, frame_height), interpolation=cv2.INTER_NEAREST)
+            return True
+        except (KeyError, TypeError):
+            return False
 
-                area = np.sum(mask)
-                y, x = np.where(mask)
-                if len(y) > 0 and len(x) > 0:
-                    top, left = np.min(y), np.min(x)
-                    bottom, right = np.max(y), np.max(x)
-                    height, width = bottom - top, right - left
-                    center_y, center_x = (top + bottom) // 2, (left + right) // 2
+    def clean_response(self, response: str) -> str:
+        """Clean and validate the response to ensure single JSON object."""
+        # Remove any markdown and text
+        response = response.replace('```json', '').replace('```', '')
+        
+        # Find all JSON objects
+        json_objects = []
+        bracket_count = 0
+        start_idx = -1
+        
+        for i, char in enumerate(response):
+            if char == '{':
+                if bracket_count == 0:
+                    start_idx = i
+                bracket_count += 1
+            elif char == '}':
+                bracket_count -= 1
+                if bracket_count == 0 and start_idx != -1:
+                    json_objects.append(response[start_idx:i+1])
+        
+        # If we found exactly one JSON object, return it
+        if len(json_objects) == 1:
+            return json_objects[0]
+        
+        # If we found multiple objects, try to find the most complete one
+        for obj in json_objects:
+            try:
+                parsed = json.loads(obj)
+                if self.validate_json_structure(parsed):
+                    return obj
+            except json.JSONDecodeError:
+                continue
+        
+        # If no valid JSON found, return the original response
+        # (it will be handled by extract_json_from_response)
+        return response
 
-                    rel_center_y = center_y / frame_height
-                    rel_center_x = center_x / frame_width
+    def extract_json_from_response(self, response: str) -> dict:
+        """Extract and parse JSON from the response string."""
+        try:
+            # First try to parse the cleaned response
+            cleaned_response = self.clean_response(response)
+            parsed_response = json.loads(cleaned_response)
+            
+            # Validate the structure
+            if self.validate_json_structure(parsed_response):
+                return parsed_response
+                
+            print("\n⚠️ Invalid JSON structure, returning error response")
+            raise ValueError("Invalid JSON structure")
+            
+        except (json.JSONDecodeError, ValueError):
+            print("\n⚠️ JSON parsing failed, returning error response")
+            # Return a standardized error response
+            return {
+                "glottis_assessment": {
+                    "overall_condition": "Error: JSON parsing failed",
+                    "symmetry": "Not available",
+                    "tissue_state": "Not available",
+                    "abnormalities": ["Response format error"]
+                },
+                "suggested_actions": ["Review system response format"]
+            }
 
-                    aspect_ratio = width / height if height != 0 else 0
-                    frame_coverage = area / (frame_width * frame_height)
-
-                    if rel_center_y < 0.33:
-                        vertical_pos = "upper"
-                    elif rel_center_y < 0.66:
-                        vertical_pos = "middle"
-                    else:
-                        vertical_pos = "lower"
-
-                    if rel_center_x < 0.33:
-                        horizontal_pos = "left"
-                    elif rel_center_x < 0.66:
-                        horizontal_pos = "center"
-                    else:
-                        horizontal_pos = "right"
-
-                    general_pos = f"{vertical_pos} {horizontal_pos}"
-
-                    mask_description = (
-                        f"Object: {class_name}, Confidence: {confidence:.2f}, "
-                        f"Position: {general_pos} of the frame, "
-                        f"Bounding Box: top-left ({top}, {left}), bottom-right ({bottom}, {right}), "
-                        f"Relative Position: center ({rel_center_x:.2f}, {rel_center_y:.2f}), "
-                        f"Size: {width}x{height} pixels, Area: {area} pixels, "
-                        f"Frame Coverage: {frame_coverage:.2%}, "
-                        f"Aspect Ratio: {aspect_ratio:.2f}"
-                    )
-
-                    frame_results.append({
-                        "class": class_name,
-                        "confidence": confidence,
-                        "mask_description": mask_description
+    async def analyze_frames(self, frames: List[Frame], max_retries: int = 3) -> ConsolidatedAnalysis:
+        """Analyze frames with retry logic and strict validation."""
+        for attempt in range(max_retries):
+            try:
+                messages = [
+                    {
+                        "type": "text", 
+                        "text": "Analyze these endoscopy images. Return EXACTLY ONE JSON object with NO additional text."
+                    }
+                ]
+                
+                # Add frame images
+                for frame in frames:
+                    image_path = str(Path(self.base_path) / frame.url.lstrip('/'))
+                    if not Path(image_path).exists():
+                        raise FileNotFoundError(f"Image not found: {image_path}")
+                    
+                    base64_image = self.encode_image(image_path)
+                    messages.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}",
+                            "detail": "high"
+                        }
                     })
 
-                    color = seg_classes.get_color_from_class(class_index)
-                    colored_mask = np.repeat(mask[:, :, np.newaxis], 3, axis=2) * np.array(color).reshape(1, 1, 3)
-                    full_mask = cv2.addWeighted(full_mask, 1, colored_mask.astype(np.uint8), 0.5, 0)
-
-                    cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+                result = await self.agent.run(messages)
+                
+                print(f"\n🔍 Raw AI Response (Attempt {attempt + 1}):")
+                print("-" * 50)
+                print(str(result.data))
+                print("-" * 50)
+                
+                # Clean and validate response
+                cleaned_response = self.clean_response(str(result.data))
+                try:
+                    analysis_dict = json.loads(cleaned_response)
+                    if self.validate_json_structure(analysis_dict):
+                        # Calculate performance metrics
+                        ai_performance = {
+                            "average_detection_confidence": sum(f.yolo_detection.confidence for f in frames) / len(frames),
+                            "average_classification_confidence": sum(f.resnet_classification.confidence for f in frames) / len(frames),
+                            "referral_frames_ratio": sum(1 for f in frames if f.resnet_classification.predicted_label == "referral") / len(frames),
+                            "total_frames_analyzed": len(frames)
+                        }
+                        
+                        return ConsolidatedAnalysis(
+                            glottis_assessment=analysis_dict["glottis_assessment"],
+                            suggested_actions=analysis_dict["suggested_actions"],
+                            ai_performance=ai_performance
+                        )
+                    else:
+                        print(f"\n⚠️ Attempt {attempt + 1}: Invalid JSON structure, retrying...")
+                except json.JSONDecodeError:
+                    print(f"\n⚠️ Attempt {attempt + 1}: Invalid JSON format, retrying...")
                     
-                    label = f"{class_name} {confidence:.2f}"
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    font_scale = 0.6
-                    font_thickness = 1
-                    top, left, font_scale = adjust_label_position(frame, label, top, left, font, font_scale, font_thickness)
-                    
-                    (label_width, label_height), baseline = cv2.getTextSize(label, font, font_scale, font_thickness)
-                    cv2.rectangle(frame, (left, top - label_height - baseline), (left + label_width, top), color, -1)
-                    
-                    # Use white text for better contrast
-                    cv2.putText(frame, label, (left, top - baseline), font, font_scale, (255, 255, 255), font_thickness)
+            except Exception as e:
+                print(f"\n❌ Error in attempt {attempt + 1}: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise
 
-            frame = cv2.addWeighted(frame, 1, full_mask, 0.5, 0)
+        # Return error response if all retries fail
+        return ConsolidatedAnalysis(
+            glottis_assessment={
+                "overall_condition": "Error: Maximum retries exceeded",
+                "symmetry": "Not available",
+                "tissue_state": "Not available",
+                "abnormalities": ["Failed to get valid response after multiple attempts"]
+            },
+            suggested_actions=["System error - please try again later"],
+            ai_performance={}
+        )
 
-        segmentation_results[frame_count] = {
-            "frame": frame_count,
-            "detections": frame_results
-        }
+async def main():
+    try:
+        # Load the JSON data
+        with open('sample_data.json', 'r') as f:
+            data = json.load(f)
+        
+        # Parse the video processing result
+        result = VideoProcessingResult(**data)
+        
+        print("\n🔍 Starting consolidated analysis of qualifying frames...")
+        print(f"Processing {result.qualifying_frames.count} frames")
+        
+        # Create analyzer and get consolidated analysis
+        analyzer = ImageAnalyzer()
+        analysis = await analyzer.analyze_frames(result.qualifying_frames.frames)
+        
+        # Print results
+        print("\n📋 Consolidated Analysis Results:")
+        print("="*50)
+        print(json.dumps(analysis.model_dump(), indent=2))
+        
+    except Exception as e:
+        print(f"\n❌ Error: {str(e)}")
 
-        out.write(frame)
-        frame_count += 1
-
-    cap.release()
-    out.release()
-    return segmentation_results
-
-# Usage
-result = process_video_with_yolo("test/video.mp4", "weights/trained_model.pt", "output/output_video.mp4")
-print(result)
+if __name__ == "__main__":
+    print("\n🚀 Starting medical image analysis...")
+    print("Make sure Ollama is running with: ollama run llama3.2-vision")
+    
+    asyncio.run(main())
