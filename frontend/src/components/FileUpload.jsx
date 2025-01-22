@@ -2,6 +2,7 @@ import useFileStore from '../stores/fileStore';
 import medicalSvg from '../assets/medical.svg';
 import axios from 'axios';
 import { useState } from 'react';
+
 function FileUpload() {
   const { 
     file, 
@@ -28,7 +29,7 @@ function FileUpload() {
       return 'File is too large. Maximum size is 800MB.';
     }
 
-    return null; // No error
+    return null;
   };
 
   const handleFileChange = (e) => {
@@ -41,7 +42,7 @@ function FileUpload() {
       } else {
         setError('');
         setFile(selectedFile);
-        resetAnalysis(); // Reset analysis when a new file is uploaded
+        resetAnalysis();
       }
     }
   };
@@ -63,20 +64,20 @@ function FileUpload() {
       const formData = new FormData();
       formData.append('file', file);
 
-      const response = await axios.post('http://localhost:8000/api/process_video/', formData, {
+      const response = await axios.post('http://localhost:8000/api/video-analyze/', formData, {
         headers: {
           'Content-Type': 'multipart/form-data',
         },
       });
 
-      if (response.data.success) {
-        setAnalysisResult(response.data.content);
+      if (response.data.status === 'success') {
+        setAnalysisResult(response.data);
         setShowModal(true);
       } else {
         throw new Error(response.data.message || 'An error occurred during analysis.');
       }
     } catch (err) {
-      console.error(err);
+      console.error('Analysis error:', err);
       setError(err.message || 'An error occurred during analysis. Please try again.');
     } finally {
       setIsLoading(false);
@@ -126,12 +127,11 @@ function FileUpload() {
         </div>
       </div>
 
-      {/* Modal */}
       {showModal && (
         <div className="modal modal-open">
           <div className="modal-box">
-            <h3 className="font-bold text-lg">Video Processing Complete!</h3>
-            <p className="py-4">Your video has been successfully processed. You can now view the analysis results below.</p>
+            <h3 className="font-bold text-lg">Analysis Complete!</h3>
+            <p className="py-4">Your video has been successfully analyzed. View the results below.</p>
             <div className="modal-action">
               <button className="btn btn-neutral" onClick={handleCloseModal}>Close</button>
             </div>

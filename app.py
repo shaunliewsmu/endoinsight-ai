@@ -1,7 +1,8 @@
 # Import necessary modules
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, APIRouter
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 import cv2
 import numpy as np
 from pathlib import Path
@@ -35,7 +36,21 @@ def prepare_for_json(data):
         return str(data)
     return data
 
+
+
 app = FastAPI()
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],  # Add your frontend URL here
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Create an APIRouter
+api_router = APIRouter()
 
 # Create output directory if it doesn't exist
 OUTPUT_DIR = Path("output")
@@ -71,7 +86,7 @@ async def root():
     """
     return {"message": "Welcome to the Head and Neck Cancer Glottis Detection API", "status": "operational"}
 
-@app.post("/image-detect-glottis")
+@api_router.post("/image-detect-glottis")
 async def image_detect_glottis(file: UploadFile = File(...)):
     """Process a single image to detect glottis using YOLO.
 
@@ -143,7 +158,7 @@ async def image_detect_glottis(file: UploadFile = File(...)):
             }
         )
 
-@app.post("/video-analyze")
+@api_router.post("/video-analyze")
 async def video_analyze(file: UploadFile = File(...)):
     """Process video with YOLO detection, ResNet classification, and LLM analysis."""
     try:
@@ -207,6 +222,10 @@ async def video_analyze(file: UploadFile = File(...)):
 
 async def process_video(file: UploadFile):
     """Process video file and extract qualifying frames."""
+    temp_path = None
+    cap = None
+    out = None
+    
     try:
         # Save uploaded video temporarily
         temp_path = OUTPUT_DIR / f"temp_{file.filename}"
@@ -217,7 +236,6 @@ async def process_video(file: UploadFile):
         # Open video file
         cap = cv2.VideoCapture(str(temp_path))
         if not cap.isOpened():
-            os.remove(temp_path)
             return {
                 "status": "error",
                 "message": "Could not open video file"
@@ -240,18 +258,37 @@ async def process_video(file: UploadFile):
         frames_folder = OUTPUT_DIR / f"qualifying_frames_{timestamp}"
         frames_folder.mkdir(exist_ok=True)
 
-        # Initialize video writer
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(
-            str(output_path),
-            fourcc,
-            fps,
-            (frame_width, frame_height)
-        )
+        # Try different codecs in order of preference
+        codecs = ['avc1', 'mp4v', 'H264', 'XVID']
+        out = None
+        
+        for codec in codecs:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                out = cv2.VideoWriter(
+                    str(output_path),
+                    fourcc,
+                    fps,
+                    (frame_width, frame_height),
+                    True  # isColor
+                )
+                if out.isOpened():
+                    print(f"Successfully initialized VideoWriter with codec: {codec}")
+                    break
+            except Exception as e:
+                print(f"Failed to initialize VideoWriter with codec {codec}: {e}")
+                if out is not None:
+                    out.release()
+                continue
+        
+        if out is None or not out.isOpened():
+            raise Exception("Failed to initialize video writer with any codec")
 
         frame_count = 0
         qualifying_frames = 0
         qualifying_frames_info = []
+
+        print(f"Starting video processing: {total_frames} frames total")
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -260,7 +297,10 @@ async def process_video(file: UploadFile):
 
             # Process frame with YOLO
             result = detector.process_image(frame)
-            out.write(result["annotated_image"])
+            success = out.write(result["annotated_image"])
+            
+            if not success:
+                print(f"Warning: Failed to write frame {frame_count}")
             
             # Check for qualifying frames
             for det in result["detections"]:
@@ -285,7 +325,7 @@ async def process_video(file: UploadFile):
                         # Perform ResNet classification on the original frame
                         resnet_result = resnet_classifier.predict(frame)
                         
-                        # Store frame info with both YOLO and ResNet results
+                        # Store frame info
                         qualifying_frames_info.append({
                             "frame_number": frame_count,
                             "url": f"/output/qualifying_frames_{timestamp}/{frame_filename}",
@@ -312,9 +352,49 @@ async def process_video(file: UploadFile):
                 print(f"Processing: {progress:.1f}% complete")
 
         # Release resources
-        cap.release()
-        out.release()
-        os.remove(temp_path)
+        if cap is not None:
+            cap.release()
+        if out is not None:
+            out.release()
+
+        # Verify the output video
+        if output_path.exists():
+            file_size = output_path.stat().st_size
+            print(f"Video saved successfully. Size: {file_size} bytes")
+            
+            if file_size == 0:
+                raise Exception("Output video file is empty")
+        else:
+            raise Exception("Output video file was not created")
+
+        # Try to convert video to web-compatible format using FFmpeg if available
+        try:
+            import ffmpeg
+            print("Converting video to web-compatible format...")
+            
+            stream = ffmpeg.input(str(output_path))
+            stream = ffmpeg.output(
+                stream, 
+                str(output_path.with_suffix('.web.mp4')),
+                vcodec='libx264',
+                acodec='aac',
+                **{'b:v': '2M'}  # 2 Mbps bitrate
+            )
+            ffmpeg.run(stream, overwrite_output=True, capture_stderr=True)
+            
+            # Replace original with converted file
+            os.replace(output_path.with_suffix('.web.mp4'), output_path)
+            print("Video conversion completed successfully")
+            
+        except ImportError:
+            print("FFmpeg Python bindings not available, skipping conversion")
+        except Exception as e:
+            print(f"FFmpeg conversion failed: {str(e)}")
+            # Continue with original file if conversion fails
+
+        # Clean up temporary file
+        if temp_path is not None and temp_path.exists():
+            os.remove(temp_path)
 
         # Return results
         if qualifying_frames_info:
@@ -344,7 +424,6 @@ async def process_video(file: UploadFile):
                 }
             }
         else:
-            # Handle case where no qualifying frames were found
             return {
                 "status": "error",
                 "message": "No qualifying frames found",
@@ -358,21 +437,26 @@ async def process_video(file: UploadFile):
             }
 
     except Exception as e:
-        # Clean up on error
-        if 'temp_path' in locals():
-            os.remove(temp_path)
-        if 'cap' in locals():
+        import traceback
+        print("Error in process_video:")
+        print(traceback.format_exc())
+        
+        # Clean up resources
+        if cap is not None:
             cap.release()
-        if 'out' in locals():
+        if out is not None:
             out.release()
+        if temp_path is not None and temp_path.exists():
+            os.remove(temp_path)
             
         return {
             "status": "error",
             "message": str(e)
         }
-        
-@app.get("/detections")
-async def list_detections():
+
+                
+@api_router.get("/analysis")
+async def list_all_analysis():
     """List all detection results from MongoDB and filesystem."""
     try:
         # Get all documents from MongoDB
@@ -442,6 +526,62 @@ async def list_detections():
                 "message": str(e)
             }
         )
+
+@api_router.get("/analysis/{analysis_id}")
+async def get_analysis(analysis_id: str):
+    """Retrieve a specific analysis result by ID.
+    
+    Args:
+        analysis_id (str): MongoDB ObjectId as string
+    
+    Returns:
+        JSONResponse: The complete analysis result or error message
+    """
+    try:
+        # Convert string ID to ObjectId
+        try:
+            obj_id = ObjectId(analysis_id)
+        except Exception:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "Invalid analysis ID format"
+                }
+            )
+        
+        # Query MongoDB for the specific document
+        result = collection.find_one({"_id": obj_id})
+        
+        # Check if document exists
+        if result is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "status": "error",
+                    "message": f"Analysis with ID {analysis_id} not found"
+                }
+            )
+        
+        # Prepare document for JSON serialization
+        prepared_result = prepare_for_json(result)
+        
+        return JSONResponse(content={
+            "status": "success",
+            "analysis": prepared_result
+        })
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": f"Failed to retrieve analysis: {str(e)}"
+            }
+        )
+
+# Include the router with a prefix
+app.include_router(api_router, prefix="/api")
 
 if __name__ == "__main__":
     """Main entry point for running the FastAPI application."""
