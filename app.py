@@ -1,3 +1,4 @@
+# Import necessary modules
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -5,10 +6,15 @@ import cv2
 import numpy as np
 from pathlib import Path
 import os
+import json
 from datetime import datetime
+
+# Import the custom modules
 from src.config import WEIGHTS_PATH, DATA_PATH, DEVICE
 from src.yolo_detector import YOLODetector
-from keras._tf_keras.keras.models import load_model
+from src.resnet_classifier import ResNetClassifier
+from src.llm_analyzer import LLMAnalyzer
+
 app = FastAPI()
 
 # Create output directory if it doesn't exist
@@ -25,88 +31,11 @@ detector = YOLODetector(
     device=DEVICE
 )
 
-class ResNetClassifier:
-    """A class to perform image classification using a pre-trained ResNet model.
-
-    This classifier is specifically designed to classify head and neck cancer endoscopy images
-    into referral and non-referral categories.
-
-    Attributes:
-        model: Loaded Keras model for classification
-        height (int): Required height for input images
-        width (int): Required width for input images
-        class_names (list): List of class names ['non-referral', 'referral']
-    """
-    def __init__(self, model_path, input_shape=(224, 224)):
-        """Initialize the ResNet classifier.
-
-        Args:
-            model_path (str): Path to the saved Keras model file
-            input_shape (tuple): Tuple of (height, width) for input images. Defaults to (224, 224)
-        """
-        self.model = load_model(model_path)
-        self.height, self.width = input_shape
-        self.class_names = ['non-referral', 'referral']
-        
-    def preprocess_image(self, img):
-        """Preprocess an image for inference.
-
-        Performs color conversion, resizing, normalization, and adds batch dimension.
-
-        Args:
-            img (numpy.ndarray): Input image in BGR format (OpenCV default)
-
-        Returns:
-            numpy.ndarray: Preprocessed image ready for model inference
-        """
-        # Convert BGR to RGB
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        # Resize to expected input shape
-        img = cv2.resize(img, (self.width, self.height))
-        
-        # Normalize
-        img = img.astype(np.float32) / 255.0
-        
-        # Add batch dimension
-        img = np.expand_dims(img, axis=0)
-        
-        return img
-        
-    def predict(self, img):
-        """Perform classification on an input image.
-
-        Args:
-            img (numpy.ndarray): Input image in BGR format
-
-        Returns:
-            dict: Dictionary containing:
-                - predicted_label (str): 'referral' or 'non-referral'
-                - confidence (float): Confidence score for the prediction
-                - class_probabilities (dict): Probabilities for each class
-        """
-        processed_img = self.preprocess_image(img)
-        prediction = self.model.predict(processed_img, verbose=0)[0]
-        
-        # Extract the scalar value from the prediction array
-        pred_value = prediction.item()  # This gets a single scalar value
-        
-        # Now use the scalar value for comparisons and conversions
-        predicted_class = int(pred_value >= 0.5)
-        confidence = float(pred_value) if predicted_class == 1 else float(1 - pred_value)
-        
-        return {
-            'predicted_label': self.class_names[predicted_class],
-            'confidence': confidence,
-            'class_probabilities': {
-                'non-referral': float(1 - pred_value),
-                'referral': float(pred_value)
-            }
-        }
-
 # Initialize ResNet classifier
 resnet_classifier = ResNetClassifier("models/sankeerthana_resnet50_model.hdf5")
 
+# Initialize LLM Analyzer
+llm_analyzer = LLMAnalyzer()
 
 @app.get("/")
 async def root():
@@ -189,28 +118,62 @@ async def image_detect_glottis(file: UploadFile = File(...)):
             }
         )
 
-@app.post("/video-detect-glottis")
-async def video_detect_glottis(file: UploadFile = File(...)):
-    """Process a video to detect glottis and classify frames.
+@app.post("/video-analyze")
+async def video_analyze(file: UploadFile = File(...)):
+    """Process video with YOLO detection, ResNet classification, and LLM analysis."""
+    try:
+        # First, process the video using existing logic
+        video_result = await process_video(file)
+        
+        # Convert video_result to dict if it's a JSONResponse
+        if isinstance(video_result, JSONResponse):
+            video_data = video_result.body
+            if isinstance(video_data, bytes):
+                video_data = json.loads(video_data)
+        else:
+            video_data = video_result
+            
+        if video_data.get("status") != "success":
+            return JSONResponse(content=video_data)
+        
+        # Check if we have qualifying frames
+        if "qualifying_frames" not in video_data:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "No qualifying frames found for analysis",
+                    **video_data
+                }
+            )
+        
+        # Perform LLM analysis on qualifying frames
+        llm_analysis = await llm_analyzer.analyze_frames(
+            video_data["qualifying_frames"]["frames"]
+        )
+        
+        # Combine results
+        final_result = {
+            **video_data,
+            "llm_analysis": llm_analysis.model_dump()
+        }
+        
+        return JSONResponse(content=final_result)
+        
+    except Exception as e:
+        import traceback
+        print("Error in video_analyze:")
+        print(traceback.format_exc())
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": f"Analysis failed: {str(e)}"
+            }
+        )
 
-    Performs both YOLO detection for glottis and ResNet classification on qualifying frames.
-    If no qualifying frames are found, falls back to sampling frames at regular intervals.
-
-    Args:
-        file (UploadFile): Uploaded video file
-
-    Returns:
-        JSONResponse: Contains:
-            - status: Success/error status
-            - message: Processing status message
-            - video_url: URL to access the processed video
-            - overall_classification: Overall classification results
-            - qualifying_frames/sampled_frames: Information about processed frames
-            - video_info: Video metadata (dimensions, fps, etc.)
-
-    Raises:
-        HTTPException: If video processing fails or invalid input
-    """
+async def process_video(file: UploadFile):
+    """Process video file and extract qualifying frames."""
     try:
         # Save uploaded video temporarily
         temp_path = OUTPUT_DIR / f"temp_{file.filename}"
@@ -222,10 +185,10 @@ async def video_detect_glottis(file: UploadFile = File(...)):
         cap = cv2.VideoCapture(str(temp_path))
         if not cap.isOpened():
             os.remove(temp_path)
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Could not open video file"}
-            )
+            return {
+                "status": "error",
+                "message": "Could not open video file"
+            }
 
         # Get video properties
         fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -305,11 +268,7 @@ async def video_detect_glottis(file: UploadFile = File(...)):
                                     "aspect_ratio": aspect_ratio
                                 }
                             },
-                            "resnet_classification": resnet_result,
-                            "frame_dimensions": {
-                                "width": frame_width,
-                                "height": frame_height
-                            }
+                            "resnet_classification": resnet_result
                         })
                         qualifying_frames += 1
                     break
@@ -324,139 +283,46 @@ async def video_detect_glottis(file: UploadFile = File(...)):
         out.release()
         os.remove(temp_path)
 
-        # Handle case where no qualifying frames were found
-        if not qualifying_frames_info:
-            print("No qualifying frames found. Attempting to process all frames...")
-            
-            # Reopen the video to process all frames
-            cap = cv2.VideoCapture(str(temp_path))
-            sampled_frames_info = []
-            frame_count = 0
-            
-            # Sample every 30th frame for analysis
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                    
-                if frame_count % 30 == 0:  # Process every 30th frame
-                    try:
-                        # Perform ResNet classification on sampled frame
-                        resnet_result = resnet_classifier.predict(frame)
-                        
-                        # Save sampled frame
-                        frame_filename = f"sampled_frame_{frame_count:04d}.jpg"
-                        frame_path = frames_folder / frame_filename
-                        cv2.imwrite(str(frame_path), frame)
-                        
-                        sampled_frames_info.append({
-                            "frame_number": frame_count,
-                            "url": f"/output/qualifying_frames_{timestamp}/{frame_filename}",
-                            "resnet_classification": resnet_result,
-                            "frame_dimensions": {
-                                "width": frame_width,
-                                "height": frame_height
-                            }
-                        })
-                        
-                        if len(sampled_frames_info) >= 10:  # Limit to 10 sampled frames
-                            break
-                            
-                    except Exception as e:
-                        print(f"Error processing frame {frame_count}: {str(e)}")
-                        
-                frame_count += 1
-                
-            cap.release()
-            
-            # Calculate classification based on sampled frames
-            if sampled_frames_info:
-                referral_count = sum(1 for frame in sampled_frames_info 
-                                   if frame["resnet_classification"]["predicted_label"] == "referral")
-                                   
-                overall_classification = {
-                    "predicted_label": "referral" if referral_count >= len(sampled_frames_info)/2 else "non-referral",
-                    "confidence_score": referral_count / len(sampled_frames_info),
-                    "referral_frame_count": referral_count,
-                    "total_sampled_frames": len(sampled_frames_info),
-                    "note": "Classification based on sampled frames due to no qualifying frames"
-                }
-                
-                return JSONResponse(content={
-                    "status": "success",
-                    "message": "No qualifying frames found. Processed using sampled frames.",
-                    "video_url": f"/output/{output_filename}",
-                    "overall_classification": overall_classification,
-                    "sampled_frames": {
-                        "folder_url": f"/output/qualifying_frames_{timestamp}",
-                        "count": len(sampled_frames_info),
-                        "note": "Using sampled frames due to no qualifying frames meeting criteria",
-                        "frames": sampled_frames_info
-                    },
-                    "video_info": {
-                        "total_frames": frame_count,
-                        "frame_width": frame_width,
-                        "frame_height": frame_height,
-                        "fps": fps
-                    }
-                })
-            else:
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "status": "error",
-                        "message": "Could not process video - no valid frames found",
-                        "video_url": f"/output/{output_filename}",
-                        "details": {
-                            "original_criteria": {
-                                "min_confidence": 0.8,
-                                "min_bbox_width": min_bbox_width,
-                                "min_bbox_height": min_bbox_height,
-                                "shape_requirements": {
-                                    "vertical_orientation": True,
-                                    "min_height_to_width_ratio": min_aspect_ratio
-                                }
-                            }
+        # Return results
+        if qualifying_frames_info:
+            return {
+                "status": "success",
+                "message": "Video processing completed with qualifying frames",
+                "video_url": f"/output/{output_filename}",
+                "qualifying_frames": {
+                    "folder_url": f"/output/qualifying_frames_{timestamp}",
+                    "count": qualifying_frames,
+                    "criteria": {
+                        "min_confidence": 0.8,
+                        "min_bbox_width": min_bbox_width,
+                        "min_bbox_height": min_bbox_height,
+                        "shape_requirements": {
+                            "vertical_orientation": True,
+                            "min_height_to_width_ratio": min_aspect_ratio
                         }
-                    }
-                )
-
-        # Normal case - qualifying frames were found
-        referral_count = sum(1 for frame in qualifying_frames_info 
-                           if frame["resnet_classification"]["predicted_label"] == "referral")
-        overall_classification = {
-            "predicted_label": "referral" if referral_count >= len(qualifying_frames_info)/2 else "non-referral",
-            "confidence_score": referral_count / len(qualifying_frames_info) if qualifying_frames_info else 0,
-            "referral_frame_count": referral_count,
-            "total_qualifying_frames": len(qualifying_frames_info)
-        }
-
-        return JSONResponse(content={
-            "status": "success",
-            "message": "Video processing completed with qualifying frames",
-            "video_url": f"/output/{output_filename}",
-            "overall_classification": overall_classification,
-            "qualifying_frames": {
-                "folder_url": f"/output/qualifying_frames_{timestamp}",
-                "count": qualifying_frames,
-                "criteria": {
-                    "min_confidence": 0.8,
-                    "min_bbox_width": min_bbox_width,
-                    "min_bbox_height": min_bbox_height,
-                    "shape_requirements": {
-                        "vertical_orientation": True,
-                        "min_height_to_width_ratio": min_aspect_ratio
-                    }
+                    },
+                    "frames": qualifying_frames_info
                 },
-                "frames": qualifying_frames_info
-            },
-            "video_info": {
-                "total_frames": frame_count,
-                "frame_width": frame_width,
-                "frame_height": frame_height,
-                "fps": fps
+                "video_info": {
+                    "total_frames": frame_count,
+                    "frame_width": frame_width,
+                    "frame_height": frame_height,
+                    "fps": fps
+                }
             }
-        })
+        else:
+            # Handle case where no qualifying frames were found
+            return {
+                "status": "error",
+                "message": "No qualifying frames found",
+                "video_url": f"/output/{output_filename}",
+                "video_info": {
+                    "total_frames": frame_count,
+                    "frame_width": frame_width,
+                    "frame_height": frame_height,
+                    "fps": fps
+                }
+            }
 
     except Exception as e:
         # Clean up on error
@@ -467,14 +333,11 @@ async def video_detect_glottis(file: UploadFile = File(...)):
         if 'out' in locals():
             out.release()
             
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "message": str(e)
-            }
-        )
-
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+        
 @app.get("/detections")
 async def list_detections():
     """List all detection files and folders in the output directory.
@@ -555,4 +418,5 @@ async def list_detections():
 if __name__ == "__main__":
     """Main entry point for running the FastAPI application."""
     import uvicorn
+    print("Starting server with LLM analysis capabilities...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
